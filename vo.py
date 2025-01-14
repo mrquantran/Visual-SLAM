@@ -42,6 +42,16 @@ class VisualOdometry:
         # --------- Feature Detectors and Matchers ---------
         self.orb = cv2_ORB.create(3000) # 3000 is the maximum number of keypoints
 
+        # --------- FLANN based matcher ---------
+        FLANN_INDEX_LSH = 6
+        index_params = dict(
+            algorithm=FLANN_INDEX_LSH, table_number=6, key_size=12, multi_probe_level=1
+        )
+        search_params = dict(checks=50)
+        self.flann = cv2.FlannBasedMatcher(
+            indexParams=index_params, searchParams=search_params
+        )
+
     def _convert_grayscale(self, img):
         if CUDA:
             if type(img) == np.ndarray or type(img) == cv2.Mat:
@@ -50,6 +60,29 @@ class VisualOdometry:
         img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
         return img_gray
+
+    def _get_matches(
+        self,
+        descs_t_1,
+        descs_t,
+        ratio_threshold=0.7,
+        distance_threshold=50.0,
+    ):
+        # FLANN based matcher
+        try:
+            matches = self.flann.knnMatch(descs_t_1, descs_t, k=2)
+        except Exception as e:
+            print(f"Error in FLANN matching: {e}")
+            return []
+
+        good_matches = []
+
+        for m, n in matches:
+            condition = m.distance < ratio_threshold * n.distance and m.distance < distance_threshold
+            if condition:
+                good_matches.append(m)
+
+        return good_matches
 
     def _compute_orb(self, img_t) -> Tuple[cv2.KeyPoint, np.ndarray]:
         """
@@ -130,7 +163,7 @@ class VisualOdometry:
 
     def _minimize_reprojection_error(self, points_2d, points_3d):
         """
-        Refer to SLAM textbook for formulation. Solved with g2o.
+        Refer to SLAM textbook P3P for formulation. Solved with g2o.
 
         Parameters
         ----------
@@ -142,11 +175,14 @@ class VisualOdometry:
         T: The transform old_T_new
         """
         assert len(points_2d) == len(points_3d)
+
+        # Initialize the nonlinear optimizer
         optimizer = g2o.SparseOptimizer()
-        solver = g2o.BlockSolverSE3(g2o.LinearSolverEigenSE3())  # TODO: Try PCG solver
-        solver = g2o.OptimizationAlgorithmLevenberg(solver)
+        solver = g2o.BlockSolverSE3(g2o.LinearSolverEigenSE3())
+        solver = g2o.OptimizationAlgorithmLevenberg(solver)  #  Levenberg-Marquardt
         optimizer.set_algorithm(solver)
 
+        # Set intrinsic camera parameters
         cam = g2o.CameraParameters(self.fx, (self.cx, self.cy), 0)
         cam.set_id(0)
         optimizer.add_parameter(cam)

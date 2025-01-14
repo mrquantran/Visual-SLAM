@@ -105,7 +105,7 @@ if __name__ == "__main__":
     # parse command line arguments
     parser = argparse.ArgumentParser(description="""This script takes two data files with timestamps and associates them""")
     parser.add_argument(
-        "--dataset-name", help="dataset name", default="rgbd_dataset_freiburg1_desk"
+        "--dataset-name", help="dataset name"
     )
 
     args = parser.parse_args()

@@ -79,7 +79,7 @@ class MapPoint:
         mean_dir = np.zeros(3) # [0.0, 0.0, 0.0]
 
         for keyframe_id in self.observed_keyframe_ids:
-            keyframe = keyframes[keyframe_id]
+            keyframe = keyframes[keyframe_id - 1]
             v = self.position - keyframe.pose[:3, 3]
             v /= np.linalg.norm(v) # Normalize
             mean_dir += v
@@ -190,66 +190,39 @@ class Tracking:
 
         return frame
 
-    def predict_pose(self, pose_t_2, pose_t_1):
-        """
-        Given two prior poses, predict the current pose. Use a constant velocity model.
+    def get_matched_points(self, mask, prev_frame:Frame, curr_frame:Frame):
+        prev_map_point_ids = np.array(prev_frame.map_point_ids)[mask].astype(int)
 
-        Derivation:
-        Let 0_T_1 be the transformation from frame at time=1 to frame at time =0, and w_T_1 be the transformation from frame at time=1 to world frame.
-        - pose_t_2 (pose at t=t-2) is w_T_1
-        - pose_t_1 (pose at t=t-1) is w_T_2
+        good_matches = self.vo._get_matches(prev_frame.descs[mask], curr_frame.descs)
 
-        We want to find pose_t (pose at t=t), i.e. w_T_3
+        matched_points = {}
 
-        We can approximate that 1_T_2 ~= 2_T_3 (velocity is constant)
-        Thus, w_T_3 = w_T_2 @ 2_T_3
-                    ~= w_T_2 @ 1_T_2
-                    ~= w_T_2 @ (1_T_w @ w_T_2)
+        for match in good_matches:
+            matched_points[match.trainIdx] = prev_map_point_ids[match.queryIdx]
 
-        """
-        return pose_t_2 @ (np.linalg.inv(pose_t_1) @ pose_t_2)
+        return matched_points, good_matches
 
     def match_map_points(self, prev_frame: Frame, curr_frame: Frame):
-        # @TODO: Implement matching of map points between frames
-
-        # 1. Identify Valid Map Points
+        # ------- Identify Valid Map Points -------
         valid_mask = np.array([map_point is not None for map_point in prev_frame.map_point_ids])
 
-        # 2. Projected into the image plane of the current frame
-        map_points = np.array([(self.map_points[map_point_id].position if map_point_id is not None else [0, 0, 0]) for map_point_id in prev_frame.map_point_ids])
-        projected_points = project_points(map_points, curr_frame.pose, self.K)
+        # @TODO: Filter out outliers
 
-        # 3. Filter Points that fall outside the visible image region are excluded
-        in_bounds_mask = (
-            (0 <= projected_points[:, 0]) & (projected_points[:, 0] < self.img_width) &
-            (0 <= projected_points[:, 1]) & (projected_points[:, 1] < self.img_height)
-        )
+        # ------- Match descriptors between Frames -------
+        matched_points, good_matches = self.get_matched_points(valid_mask, prev_frame, curr_frame)
+        print(f"Number of matches: {len(good_matches)}")
 
-        # 4. Filter Points with Poor Viewing Angles
-        mean_viewing_angle = np.array(
-            [
-                (
-                    angle_between(
-                        self.map_points[map_point_id].mean_viewing_dir,
-                        self.map_points[map_point_id].position - curr_frame.pose[:3, 3],
-                    )
-                    if map_point_id is not None
-                    else 0
-                )
-                for map_point_id in prev_frame.map_point_ids
-            ]
-        )
-        mean_viewing_angle_mask = mean_viewing_angle < np.pi / 3
-
-        # 5. Combine Masks
-        final_mask = valid_mask & in_bounds_mask & mean_viewing_angle_mask
-
-        # 6. Match descriptors between Frames
-        # @TODO: Implement matching of descriptors between frames
-        good_matches = []
+        # ------- Add Map Point IDs to Current Frame -------
+        map_point_ids_set = set(curr_frame.map_point_ids)
+        for idx, map_point_id in matched_points.items():
+            if curr_frame.map_point_ids[idx] is None and map_point_id not in map_point_ids_set:
+                curr_frame.map_point_ids[idx] = map_point_id
+                map_point_ids_set.add(map_point_id)
 
         if self.visualize:
-            prev_frame_cv_kpts = [cv2.KeyPoint(kpt[0], kpt[1], 1) for kpt in prev_frame.kpts[final_mask]]
+            prev_frame_cv_kpts = [
+                cv2.KeyPoint(kpt[0], kpt[1], 1) for kpt in prev_frame.kpts[valid_mask]
+            ]
             curr_frame_cv_kpts = [cv2.KeyPoint(kpt[0], kpt[1], 1) for kpt in curr_frame.kpts]
             print(f"Number of prev frame keypoints: {len(prev_frame_cv_kpts)}")
             print(f"Number of curr frame keypoints: {len(curr_frame_cv_kpts)}")
@@ -263,7 +236,7 @@ class Tracking:
         self.img_width = img_t.shape[1]
         self.img_height = img_t.shape[0]
 
-        # ------- Convert Image to Grayscale -------
+        # ------- Convert Image to Grayscale (for ORB feature) -------
         img_gray_t = self.vo._convert_grayscale(img_t)
         kpts_t, desc_t = self.vo._compute_orb(img_gray_t)
         kpts_t = np.array([k.pt for k in kpts_t])
@@ -276,13 +249,11 @@ class Tracking:
         desc_t = desc_t[~mask]
         points_3d_k = points_3d_k[~mask]
 
-        predicted_pose = self.initial_pose
-
         # ------- Predict Pose using constant velocity model -------
         if len(self.frames) >= 2:
-            predicted_pose = self.predict_pose(
-                self.frames[-2].pose, self.frames[-1].pose
-            )
+            predicted_pose = self.frames[-1].pose
+        else:
+            predicted_pose = self.initial_pose
 
         # --------- Convert 3D points to world coordinate -----------
         points_3d_w = (
@@ -298,9 +269,6 @@ class Tracking:
         if len(self.frames) == 0:
             keyframe = self.add_keyframe_tracking(curr_frame)
             self.frames.append(keyframe)
-
-            # @TODO: Implement Bundle Adjustment
-
             return
 
         # ---------- Compute Visible Map Points in previous frame from current frame -----------
@@ -322,17 +290,16 @@ class Tracking:
 
         # ---------- Filter out points that are not map points -----------
         assert len(p_2d) == len(p_3d_w)
-        valid_pts_mask = np.array(
-            [map_point is not None for map_point in curr_frame.map_point_ids]
-        )
+
+        valid_pts_mask = np.array([map_point is not None for map_point in curr_frame.map_point_ids])
         p_2d = p_2d[valid_pts_mask]
         p_3d_w = p_3d_w[valid_pts_mask]
+
+        # ------- Convert 3D points to camera coordinate -------
         k_T_w = np.linalg.inv(curr_frame.pose)
         p_3d_k = (k_T_w @ np.hstack([p_3d_w, np.ones((len(p_3d_w), 1))]).T).T[:, :3]
 
-        print("Total map points tracked", len(p_2d))
-
-        # ------- Estimate Camera Post by minimizing reprojection error -------
+        # ------- Estimate Camera Pose by minimizing reprojection error -------
         T = self.vo._minimize_reprojection_error(p_2d, p_3d_k)
         estimated_pose = prev_frame.pose @ T
         curr_frame.pose = estimated_pose
@@ -348,12 +315,11 @@ class Tracking:
         self.frames_elapsed_since_keyframe += 1
 
         if self.save_path:
-            # Save the poses to a file
-
             with open(self.output_path, "a") as file:
                 pose = self.frames[-1].pose
                 position = pose[:3, 3]
                 quaternion = rotation_matrix_to_quaternion(pose[:3, :3])
 
                 pose_list = list(position) + list(quaternion)
+
                 file.write(f"{timestamp} {' '.join(map(str, pose_list))}\n")
